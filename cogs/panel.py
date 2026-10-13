@@ -302,6 +302,7 @@ class HumanMMClaimView(discord.ui.View):
 _human_claim_locks = {}
 
 
+_saved_transcripts = set()  # channel ids whose transcript was already saved
 _pending_close = set()  # channel ids that currently have an open "both traders must confirm" request
 
 
@@ -371,7 +372,7 @@ class MutualCloseView(discord.ui.View):
         if not ok:
             try:
                 await interaction.message.edit(
-                    embed=self.make_embed("Could not save the transcript, so the ticket was left open. Ask staff."),
+                    embed=self.make_embed("The ticket could not be closed. See the warning below or ask staff."),
                     view=None)
             except Exception:
                 pass
@@ -442,6 +443,8 @@ class CloseTicketView(discord.ui.View):
 
 async def close_ticket_channel(channel, closed_by, interaction=None):
     config = load_config()
+    if channel.id in _saved_transcripts:
+        return await _delete_ticket(channel, closed_by, interaction)
     messages = []
     try:
         async for msg in channel.history(limit=None, oldest_first=True):
@@ -504,10 +507,37 @@ async def close_ticket_channel(channel, closed_by, interaction=None):
             print(f"[transcript] No ticket_logs or deal_logs channel is configured for #{channel.name}")
         return False
 
-    if interaction:
-        await interaction.followup.send("Ticket closed. Transcript saved for staff.", ephemeral=True)
-    await channel.delete(reason=f"Closed by {closed_by}")
-    return True
+    _saved_transcripts.add(channel.id)
+    return await _delete_ticket(channel, closed_by, interaction)
+
+
+async def _delete_ticket(channel, closed_by, interaction=None):
+    """Delete the ticket channel. If Discord refuses, say exactly why instead of failing silently."""
+    try:
+        await channel.delete(reason=f"Closed by {closed_by}")
+    except discord.Forbidden:
+        problem = ("I saved the transcript but **can't delete this channel**: I'm missing the "
+                   "**Manage Channels** permission here. In Server Settings -> Roles, give my role "
+                   "Manage Channels (and check the ticket category doesn't deny it), then press Close again.")
+    except discord.NotFound:
+        _saved_transcripts.discard(channel.id)
+        return True  # already gone
+    except Exception as exc:
+        problem = f"I saved the transcript but couldn't delete this channel: `{type(exc).__name__}: {exc}`"
+    else:
+        _saved_transcripts.discard(channel.id)
+        if interaction:
+            try:
+                await interaction.followup.send("Ticket closed. Transcript saved for staff.", ephemeral=True)
+            except Exception:
+                pass
+        return True
+    print(f"[close] could not delete #{channel.name}: {problem}")
+    try:
+        await channel.send(f"⚠️ {problem}")
+    except Exception:
+        pass
+    return False
 
 
 # ==================== COG ====================
