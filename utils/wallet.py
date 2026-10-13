@@ -63,22 +63,49 @@ def calc_fee(config, usd: float) -> float:
 
 
 _price_cache = {}
+_PRICE_FRESH = 60      # seconds a price is reused without asking again
+_PRICE_STALE_OK = 900  # if every source fails, reuse a price up to 15 min old
+
+
+async def _get_json(url: str):
+    async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0 TimeAutoMM"}) as s:
+        async with s.get(url, timeout=aiohttp.ClientTimeout(total=8)) as r:
+            return await r.json(content_type=None)
+
+
+def _price_sources(coin: str):
+    """(name, url, parser) – tried in order. CoinGecko often rate-limits shared
+    hosts like Render, so several free fallbacks follow it."""
+    cg = COINS[coin]["cg"]
+    return [
+        ("coingecko", f"https://api.coingecko.com/api/v3/simple/price?ids={cg}&vs_currencies=usd",
+         lambda d: d[cg]["usd"]),
+        ("coinbase", f"https://api.coinbase.com/v2/prices/{coin}-USD/spot",
+         lambda d: d["data"]["amount"]),
+        ("kraken", f"https://api.kraken.com/0/public/Ticker?pair={coin}USD",
+         lambda d: next(iter(d["result"].values()))["c"][0]),
+        ("cryptocompare", f"https://min-api.cryptocompare.com/data/price?fsym={coin}&tsyms=USD",
+         lambda d: d["USD"]),
+    ]
 
 
 async def get_price_usd(coin: str) -> float:
     cached = _price_cache.get(coin)
-    if cached and time.time() - cached[1] < 60:
+    if cached and time.time() - cached[1] < _PRICE_FRESH:
         return cached[0]
-    url = f"https://api.coingecko.com/api/v3/simple/price?ids={COINS[coin]['cg']}&vs_currencies=usd"
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
-                data = await r.json()
-        price = float(data[COINS[coin]["cg"]]["usd"])
-    except Exception as e:
-        raise WalletError(f"Could not fetch {coin} price: {e}")
-    _price_cache[coin] = (price, time.time())
-    return price
+    errors = []
+    for name, url, parse in _price_sources(coin):
+        try:
+            price = float(parse(await _get_json(url)))
+            if price <= 0:
+                raise ValueError("price <= 0")
+            _price_cache[coin] = (price, time.time())
+            return price
+        except Exception as e:
+            errors.append(f"{name}: {type(e).__name__} {e}")
+    if cached and time.time() - cached[1] < _PRICE_STALE_OK:
+        return cached[0]
+    raise WalletError(f"Could not fetch {coin} price (all sources failed): " + " | ".join(errors))
 
 
 class WalletBackend:

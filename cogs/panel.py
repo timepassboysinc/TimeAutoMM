@@ -7,6 +7,7 @@ import os
 from datetime import datetime
 from urllib.parse import urlparse
 from utils.embeds import get_color
+from utils import deals as deal_store
 
 def load_config():
     with open("config.json", "r") as f:
@@ -301,6 +302,125 @@ class HumanMMClaimView(discord.ui.View):
 _human_claim_locks = {}
 
 
+_pending_close = set()  # channel ids that currently have an open "both traders must confirm" request
+
+
+def _is_staff(member, config):
+    perms = getattr(member, "guild_permissions", None)
+    if perms and perms.administrator:
+        return True
+    ids = {config.get("roles", {}).get("staff", 0), config.get("roles", {}).get("admin", 0)}
+    return any(r.id in ids for r in getattr(member, "roles", []))
+
+
+class MutualCloseView(discord.ui.View):
+    """Closing an Auto MM ticket needs BOTH traders to confirm. The transcript is saved on close."""
+
+    def __init__(self, channel, user_ids, requester):
+        super().__init__(timeout=600)
+        self.channel = channel
+        self.user_ids = list(user_ids)
+        self.confirmed = {requester.id}  # the person who pressed Close counts as confirmed
+        self.message = None
+        self.finished = False
+
+    def make_embed(self, footer=None):
+        config = load_config()
+        lines = [("✅" if uid in self.confirmed else "⏳") + f" <@{uid}>" for uid in self.user_ids]
+        emb = discord.Embed(
+            title="Close this ticket?",
+            description="**Both traders must confirm** before this ticket closes.\n"
+                        "A transcript is saved for staff when it closes.\n\n" + "\n".join(lines),
+            color=get_color(config, "warning"))
+        if footer:
+            emb.set_footer(text=footer)
+        return emb
+
+    def _names(self, guild):
+        out = []
+        for uid in self.user_ids:
+            m = guild.get_member(uid)
+            out.append(f"{m} ({uid})" if m else str(uid))
+        return " & ".join(out)
+
+    @discord.ui.button(label="Confirm Close", style=discord.ButtonStyle.success)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.finished:
+            return await interaction.response.send_message("This close request has ended.", ephemeral=True)
+        uid = interaction.user.id
+        if uid not in self.user_ids:
+            return await interaction.response.send_message(
+                "Only the two traders in this deal can confirm.", ephemeral=True)
+        if uid in self.confirmed:
+            return await interaction.response.send_message(
+                "You already confirmed. Waiting for the other trader.", ephemeral=True)
+        self.confirmed.add(uid)
+        if len(self.confirmed) < len(self.user_ids):
+            return await interaction.response.edit_message(embed=self.make_embed())
+
+        # both traders confirmed
+        self.finished = True
+        self.stop()
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(
+            embed=self.make_embed("Both traders confirmed. Saving transcript and closing..."), view=self)
+        closed_by = f"{self._names(interaction.guild)} (both confirmed)"
+        ok = await close_ticket_channel(self.channel, closed_by, interaction)
+        _pending_close.discard(self.channel.id)
+        if not ok:
+            try:
+                await interaction.message.edit(
+                    embed=self.make_embed("Could not save the transcript, so the ticket was left open. Ask staff."),
+                    view=None)
+            except Exception:
+                pass
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.finished:
+            return await interaction.response.send_message("This close request has ended.", ephemeral=True)
+        if interaction.user.id not in self.user_ids and not _is_staff(interaction.user, load_config()):
+            return await interaction.response.send_message(
+                "Only the traders in this deal can cancel this.", ephemeral=True)
+        self.finished = True
+        self.stop()
+        _pending_close.discard(self.channel.id)
+        await interaction.response.edit_message(
+            embed=self.make_embed(f"Close request cancelled by {interaction.user}."), view=None)
+
+    async def on_timeout(self):
+        self.finished = True
+        _pending_close.discard(self.channel.id)
+        if self.message:
+            try:
+                await self.message.edit(embed=self.make_embed("Close request expired. Press Close Ticket again."),
+                                        view=None)
+            except Exception:
+                pass
+
+
+async def request_mutual_close(interaction, deal):
+    ids = [int(deal["creator_id"]), int(deal["trader_id"])]
+    if interaction.user.id not in ids:
+        return await interaction.response.send_message(
+            "Only the two traders in this deal can close this ticket.", ephemeral=True)
+    cid = interaction.channel.id
+    if cid in _pending_close:
+        return await interaction.response.send_message(
+            "A close request is already open here. Both traders need to press Confirm Close on it.",
+            ephemeral=True)
+    view = MutualCloseView(interaction.channel, ids, interaction.user)
+    _pending_close.add(cid)
+    try:
+        await interaction.response.send_message(
+            content=" ".join(f"<@{u}>" for u in ids), embed=view.make_embed(), view=view)
+        view.message = await interaction.original_response()
+    except Exception:
+        _pending_close.discard(cid)
+        raise
+
+
 class CloseTicketView(discord.ui.View):
     def __init__(self, transaction_url=None):
         super().__init__(timeout=None)
@@ -310,6 +430,12 @@ class CloseTicketView(discord.ui.View):
 
     @discord.ui.button(label="Close Ticket", style=discord.ButtonStyle.danger, custom_id="close_ticket")
     async def close(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Auto MM deal tickets: both traders must confirm (staff/admin can still close directly).
+        deal = deal_store.get(interaction.channel.id)
+        if deal and deal.get("creator_id") and deal.get("trader_id") \
+                and not _is_staff(interaction.user, load_config()):
+            return await request_mutual_close(interaction, deal)
+        # Human MM / shop tickets (and staff): close right away, as before.
         await interaction.response.defer()
         await close_ticket_channel(interaction.channel, f"{interaction.user} ({interaction.user.id})", interaction)
 
