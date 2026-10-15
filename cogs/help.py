@@ -11,8 +11,12 @@ class Help(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
+    @commands.command(name="hello")
+    async def hello_command(self, ctx):
+        """Quick check that the bot can receive prefix commands."""
+        await ctx.send(f"👋 Hello, {ctx.author.mention}! Prefix commands are working.")
+
     @commands.command(name="help")
-    @commands.has_permissions(administrator=True)
     async def help_command(self, ctx):
         config = load_config()
         embed = discord.Embed(title="Time AutoMM — Help", color=get_color(config, "accent"))

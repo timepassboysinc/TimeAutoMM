@@ -35,6 +35,22 @@ async def on_ready():
         )
     )
 
+@bot.event
+async def on_command_error(ctx, error):
+    """Give users feedback when a prefix command fails instead of silently failing."""
+    if isinstance(error, commands.CommandNotFound):
+        await ctx.reply("I don't know that dot command. Try `.help`.", mention_author=False)
+        return
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.reply("You don't have permission to use that command.", mention_author=False)
+        return
+    if isinstance(error, commands.MissingRequiredArgument):
+        await ctx.reply(f"You're missing `{error.param.name}`. Try `.help` for command examples.", mention_author=False)
+        return
+
+    print(f"❌ Prefix command error in {ctx.command}: {type(error).__name__}: {error}")
+    await ctx.reply("That command hit an error. The bot owner can check the Render logs.", mention_author=False)
+
 async def load_cogs():
     for filename in os.listdir("./cogs"):
         if filename.endswith(".py"):
